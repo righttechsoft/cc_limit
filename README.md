@@ -2,7 +2,7 @@
 
 A thin status bar that sits at the top of your screen and shows how much of your current Claude session you've used.
 
-![bar example](https://placeholder)
+![bar example](bar_example.png)
 
 ## What it does
 

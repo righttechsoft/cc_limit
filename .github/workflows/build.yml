@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+          - target: i686-pc-windows-msvc
+            arch: x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: stage artifact
+        shell: pwsh
+        run: |
+          $stage = "dist/cc_limit-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/cc_limit.exe" "$stage/"
+          Copy-Item "README.md" "$stage/"
+          Copy-Item "c.ico" "$stage/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/cc_limit-${{ matrix.arch }}.zip" -Force
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc_limit-${{ matrix.arch }}
+          path: dist/cc_limit-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: collect zips
+        run: |
+          mkdir -p release
+          find artifacts -name '*.zip' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false

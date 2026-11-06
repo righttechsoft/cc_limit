@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 use std::fs;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
@@ -14,19 +15,22 @@ use serde_json::{json, Value};
 use winapi::shared::minwindef::{BOOL, DWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM};
 use winapi::shared::windef::{HBRUSH, HMENU, HMONITOR, HWND, RECT};
 use winapi::um::errhandlingapi::GetLastError;
+use winapi::shared::winerror::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
 use winapi::um::libloaderapi::GetModuleHandleW;
+use winapi::um::synchapi::CreateMutexW;
 use winapi::um::shellapi::{
     SHAppBarMessage, Shell_NotifyIconW, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
     APPBARDATA, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use winapi::um::wingdi::{
-    CreateSolidBrush, DeleteObject, GetStockObject, SelectObject, SetBkMode, SetTextColor,
-    TextOutW, DEFAULT_GUI_FONT, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, Ellipse, GetStockObject, GetTextExtentPoint32W, SelectObject,
+    SetBkMode, SetTextColor, TextOutW, DEFAULT_GUI_FONT, NULL_PEN, TRANSPARENT,
 };
 use winapi::um::winhttp::{
     WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE,
 };
 use winapi::um::winuser::{
     AppendMenuW, BeginPaint, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -47,6 +51,7 @@ const TIMER_REFRESH: usize = 1;
 const TIMER_RETRY: usize = 2;
 const REFRESH_MS: UINT = 60_000;
 const RETRY_MS: UINT = 15_000;
+const RETRY_MAX_MS: UINT = 900_000;
 const BAR_HEIGHT: i32 = 18;
 const TRAY_ID: u32 = 1;
 const TRAY_CALLBACK: UINT = WM_USER + 1;
@@ -62,6 +67,12 @@ const COLOR_FILL: u32 = 0x00E07020;
 const COLOR_FILL_WARN: u32 = 0x002080F0;
 const COLOR_FILL_CRIT: u32 = 0x002020F0;
 const COLOR_TEXT: u32 = 0x00404040;
+const COLOR_DOT_FRESH: u32 = 0x0030C030;
+const COLOR_DOT_STALE: u32 = 0x0020C0E0;
+const COLOR_DOT_DEAD: u32 = 0x002020F0;
+// ponytail: fresh = up to 2 missed refreshes, dead = 10 min without data
+const DOT_FRESH_SECS: i64 = 150;
+const DOT_STALE_SECS: i64 = 600;
 
 #[derive(Clone)]
 struct MonitorInfo {
@@ -73,9 +84,12 @@ struct MonitorInfo {
 #[derive(Clone)]
 struct AppState {
     used_pct: Option<f64>,
+    weekly_pct: Option<f64>,
     resets_at_epoch: Option<i64>,
+    last_success_epoch: Option<i64>,
     label: String,
     error: Option<String>,
+    fails: u32,
     monitors: Vec<MonitorInfo>,
     selected_device: Option<String>,
     appbar_registered: bool,
@@ -84,9 +98,12 @@ struct AppState {
 static STATE: Lazy<Mutex<AppState>> = Lazy::new(|| {
     Mutex::new(AppState {
         used_pct: None,
+        weekly_pct: None,
         resets_at_epoch: None,
+        last_success_epoch: None,
         label: "loading…".into(),
         error: None,
+        fails: 0,
         monitors: Vec::new(),
         selected_device: load_config_device(),
         appbar_registered: false,
@@ -120,6 +137,50 @@ fn load_config_device() -> Option<String> {
 fn save_config_device(device: &str) {
     let v = json!({ "monitor_device": device });
     let _ = fs::write(config_path(), v.to_string());
+}
+
+fn log_path() -> PathBuf {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_default();
+    let dir = local.join("cc_limit");
+    let _ = fs::create_dir_all(&dir);
+    dir.join("errors.log")
+}
+
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn format_utc(epoch: i64) -> String {
+    let days = epoch.div_euclid(86400);
+    let mut secs = epoch.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    let h = secs / 3600;
+    secs %= 3600;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        y,
+        mo,
+        d,
+        h,
+        secs / 60,
+        secs % 60
+    )
+}
+
+fn log_error(msg: &str) {
+    let path = log_path();
+    // ponytail: rename-rotate at 256KB, real log framework if this ever needs more
+    if fs::metadata(&path).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+        let old = path.with_extension("log.old");
+        let _ = fs::remove_file(&old);
+        let _ = fs::rename(&path, &old);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {}", format_utc(now_epoch()), msg);
+    }
 }
 
 fn credentials_path() -> PathBuf {
@@ -227,19 +288,58 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn parse_usage(resp: &str) -> Result<(f64, Option<i64>), String> {
-    let v: Value = serde_json::from_str(resp).map_err(|e| format!("json: {}", e))?;
-    let five_hour = v.get("five_hour").ok_or_else(|| "no five_hour field".to_string())?;
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    ((y + if m <= 2 { 1 } else { 0 }) as i32, m as u32, d as u32)
+}
+
+fn fill_color_for(pct: f64) -> u32 {
+    if pct >= 90.0 {
+        COLOR_FILL_CRIT
+    } else if pct >= 70.0 {
+        COLOR_FILL_WARN
+    } else {
+        COLOR_FILL
+    }
+}
+
+fn extract_pct(obj: &Value) -> Option<f64> {
     let pct = ["utilization", "percent", "used", "percentage"]
         .iter()
-        .find_map(|k| five_hour.get(*k).and_then(extract_number))
-        .or_else(|| extract_number(five_hour))
-        .ok_or_else(|| "no pct in five_hour".to_string())?;
-    let pct = if pct <= 1.0 { pct * 100.0 } else { pct };
+        .find_map(|k| obj.get(*k).and_then(extract_number))
+        .or_else(|| extract_number(obj))?;
+    Some(if pct <= 1.0 { pct * 100.0 } else { pct })
+}
+
+fn window_pct(obj: &Value) -> Option<f64> {
+    if obj.is_null() || obj.get("utilization").map_or(false, Value::is_null) {
+        return Some(0.0);
+    }
+    extract_pct(obj)
+}
+
+fn retry_delay_ms(fails: u32) -> u32 {
+    let shift = fails.saturating_sub(1).min(16);
+    (RETRY_MS << shift).min(RETRY_MAX_MS)
+}
+
+fn parse_usage(resp: &str) -> Result<(f64, Option<i64>, Option<f64>), String> {
+    let v: Value = serde_json::from_str(resp).map_err(|e| format!("json: {}", e))?;
+    let five_hour = v.get("five_hour").ok_or_else(|| "no five_hour field".to_string())?;
+    let pct = window_pct(five_hour).ok_or_else(|| "no pct in five_hour".to_string())?;
+    let weekly = v.get("seven_day").and_then(window_pct);
     let reset = ["resets_at", "reset_at", "reset"]
         .iter()
         .find_map(|k| five_hour.get(*k).and_then(extract_epoch));
-    Ok((pct, reset))
+    Ok((pct, reset, weekly))
 }
 
 fn fetch_usage(token: &str) -> Result<String, String> {
@@ -302,6 +402,16 @@ fn fetch_usage(token: &str) -> Result<String, String> {
             WinHttpCloseHandle(session);
             return Err(format!("WinHttpReceiveResponse {}", e));
         }
+        let mut status: DWORD = 0;
+        let mut status_len: DWORD = std::mem::size_of::<DWORD>() as DWORD;
+        let have_status = WinHttpQueryHeaders(
+            req,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            ptr::null(),
+            &mut status as *mut _ as *mut _,
+            &mut status_len,
+            ptr::null_mut(),
+        ) != 0;
         let mut out: Vec<u8> = Vec::new();
         loop {
             let mut avail: DWORD = 0;
@@ -322,7 +432,20 @@ fn fetch_usage(token: &str) -> Result<String, String> {
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
         WinHttpCloseHandle(session);
-        String::from_utf8(out).map_err(|e| format!("utf8: {}", e))
+        let body = String::from_utf8(out).map_err(|e| format!("utf8: {}", e))?;
+        if !have_status {
+            return Err("no HTTP status".into());
+        }
+        if status != 200 {
+            let kind = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error")?.get("type")?.as_str().map(String::from));
+            return Err(match kind {
+                Some(k) => format!("HTTP {} {}", status, k),
+                None => format!("HTTP {}", status),
+            });
+        }
+        Ok(body)
     }
 }
 
@@ -500,7 +623,7 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 
 fn refresh(hwnd_usize: usize) {
     let hwnd = hwnd_usize as HWND;
-    let result: Result<(f64, Option<i64>), String> = (|| {
+    let result: Result<(f64, Option<i64>, Option<f64>), String> = (|| {
         let token = read_access_token()?;
         let body = fetch_usage(&token)?;
         let _ = fs::write(debug_path(), &body);
@@ -508,29 +631,40 @@ fn refresh(hwnd_usize: usize) {
     })();
     let tip;
     match result {
-        Ok((pct, reset)) => {
+        Ok((pct, reset, weekly)) => {
             let label = format_label(pct, reset);
             {
                 let mut guard = STATE.lock().unwrap();
                 guard.used_pct = Some(pct);
+                guard.weekly_pct = weekly;
                 guard.resets_at_epoch = reset;
+                guard.last_success_epoch = Some(now_epoch());
                 guard.label = label.clone();
                 guard.error = None;
+                guard.fails = 0;
             }
             tip = format!("cc_limit · {}", label);
             unsafe {
                 KillTimer(hwnd, TIMER_RETRY);
+                SetTimer(hwnd, TIMER_REFRESH, REFRESH_MS, None);
             }
         }
         Err(e) => {
-            let prev_label = {
+            log_error(&e);
+            let (prev_label, delay) = {
                 let mut guard = STATE.lock().unwrap();
                 guard.error = Some(e.clone());
-                guard.label.clone()
+                guard.fails = guard.fails.saturating_add(1);
+                let delay = retry_delay_ms(guard.fails);
+                if guard.used_pct.is_none() {
+                    guard.label = format!("{} · retry in {}", e, format_delay(delay));
+                }
+                (guard.label.clone(), delay)
             };
             tip = format!("cc_limit · {} (transient err: {})", prev_label, e);
             unsafe {
-                SetTimer(hwnd, TIMER_RETRY, RETRY_MS, None);
+                KillTimer(hwnd, TIMER_REFRESH);
+                SetTimer(hwnd, TIMER_RETRY, delay, None);
             }
         }
     }
@@ -540,11 +674,17 @@ fn refresh(hwnd_usize: usize) {
     }
 }
 
+fn format_delay(ms: u32) -> String {
+    let secs = ms.div_ceil(1000);
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m", secs.div_ceil(60))
+    }
+}
+
 fn format_label(pct: f64, reset: Option<i64>) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = now_epoch();
     let suffix = match reset {
         Some(t) if t > now => {
             let mut s = t - now;
@@ -647,14 +787,21 @@ unsafe extern "system" fn wndproc(
 
             let snapshot = STATE.lock().unwrap().clone();
 
+            let label = snapshot.label.clone();
+            let text = wstr(&label);
+            let font = GetStockObject(DEFAULT_GUI_FONT as i32);
+            let old = SelectObject(hdc, font);
+            let mut text_size: winapi::shared::windef::SIZE = std::mem::zeroed();
+            GetTextExtentPoint32W(hdc, text.as_ptr(), (text.len() - 1) as i32, &mut text_size);
+            let dot_d = 7;
+
             let track_left = 4;
-            let track_right_pad = 240;
             let track_top = (rc.bottom - rc.top) / 2 - 4;
             let track_bot = track_top + 8;
             let track_rc = RECT {
                 left: track_left,
                 top: track_top,
-                right: (rc.right - track_right_pad).max(track_left + 20),
+                right: (rc.right - 4 - dot_d - 6 - text_size.cx - 8).max(track_left + 20),
                 bottom: track_bot,
             };
             let track_brush = CreateSolidBrush(COLOR_TRACK);
@@ -662,14 +809,7 @@ unsafe extern "system" fn wndproc(
             DeleteObject(track_brush as _);
 
             let pct = snapshot.used_pct.unwrap_or(0.0);
-            let label = snapshot.label;
-            let fill_color = if pct >= 90.0 {
-                COLOR_FILL_CRIT
-            } else if pct >= 70.0 {
-                COLOR_FILL_WARN
-            } else {
-                COLOR_FILL
-            };
+            let fill_color = fill_color_for(pct);
             let width = (track_rc.right - track_rc.left) as f64;
             let fill_w = (width * (pct.clamp(0.0, 100.0) / 100.0)) as i32;
             if fill_w > 0 {
@@ -684,15 +824,51 @@ unsafe extern "system" fn wndproc(
                 DeleteObject(fill_brush as _);
             }
 
+            if let Some(wp) = snapshot.weekly_pct {
+                let strip_rc = RECT {
+                    left: track_rc.left,
+                    top: rc.top,
+                    right: track_rc.right,
+                    bottom: rc.top + 3,
+                };
+                let strip_brush = CreateSolidBrush(COLOR_TRACK);
+                FillRect(hdc, &strip_rc, strip_brush);
+                DeleteObject(strip_brush as _);
+                let strip_w = ((strip_rc.right - strip_rc.left) as f64
+                    * (wp.clamp(0.0, 100.0) / 100.0)) as i32;
+                if strip_w > 0 {
+                    let strip_fill = RECT {
+                        right: strip_rc.left + strip_w,
+                        ..strip_rc
+                    };
+                    let b = CreateSolidBrush(fill_color_for(wp));
+                    FillRect(hdc, &strip_fill, b);
+                    DeleteObject(b as _);
+                }
+            }
+
             SetBkMode(hdc, TRANSPARENT as i32);
             SetTextColor(hdc, COLOR_TEXT);
-            let font = GetStockObject(DEFAULT_GUI_FONT as i32);
-            let old = SelectObject(hdc, font);
-            let text = wstr(&label);
-            let text_x = (rc.right - track_right_pad + 8).max(track_left);
+            let text_x = track_rc.right + 8;
             let text_y = (rc.bottom - rc.top) / 2 - 7;
             TextOutW(hdc, text_x, text_y, text.as_ptr(), (text.len() - 1) as i32);
             SelectObject(hdc, old);
+
+            let age = snapshot.last_success_epoch.map(|t| now_epoch() - t);
+            let dot_color = match age {
+                Some(a) if a < DOT_FRESH_SECS => COLOR_DOT_FRESH,
+                Some(a) if a < DOT_STALE_SECS => COLOR_DOT_STALE,
+                _ => COLOR_DOT_DEAD,
+            };
+            let dot_x = rc.right - dot_d - 4;
+            let dot_y = (rc.bottom - rc.top) / 2 - dot_d / 2;
+            let dot_brush = CreateSolidBrush(dot_color);
+            let old_brush = SelectObject(hdc, dot_brush as _);
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN as i32));
+            Ellipse(hdc, dot_x, dot_y, dot_x + dot_d, dot_y + dot_d);
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(dot_brush as _);
 
             EndPaint(hwnd, &ps);
             0
@@ -758,8 +934,62 @@ unsafe extern "system" fn wndproc(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_roundtrip() {
+        for &(y, m, d) in &[(1970, 1, 1), (2000, 2, 29), (2026, 7, 6), (2099, 12, 31)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+        assert_eq!(format_utc(0), "1970-01-01 00:00:00Z");
+    }
+
+    #[test]
+    fn retry_delay_backoff() {
+        assert_eq!(retry_delay_ms(0), RETRY_MS);
+        assert_eq!(retry_delay_ms(1), RETRY_MS);
+        assert_eq!(retry_delay_ms(2), RETRY_MS * 2);
+        assert_eq!(retry_delay_ms(3), RETRY_MS * 4);
+        assert_eq!(retry_delay_ms(20), RETRY_MAX_MS);
+        assert_eq!(retry_delay_ms(u32::MAX), RETRY_MAX_MS);
+    }
+
+    #[test]
+    fn parse_usage_cases() {
+        let (p, r, w) = parse_usage(
+            r#"{"five_hour":{"utilization":42.0,"resets_at":"2026-01-01T00:00:00Z"},"seven_day":{"utilization":10.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(p, 42.0);
+        assert!(r.is_some());
+        assert_eq!(w, Some(10.0));
+
+        let (p, r, w) = parse_usage(r#"{"five_hour":null,"seven_day":null}"#).unwrap();
+        assert_eq!((p, r), (0.0, None));
+        assert_eq!(w, Some(0.0));
+
+        let (p, r, _) = parse_usage(r#"{"five_hour":{"utilization":null,"resets_at":null}}"#).unwrap();
+        assert_eq!((p, r), (0.0, None));
+
+        let (p, _, w) = parse_usage(r#"{"five_hour":{"utilization":5.0}}"#).unwrap();
+        assert_eq!(p, 5.0);
+        assert_eq!(w, None);
+    }
+}
+
 fn main() {
     unsafe {
+        let mutex_name = wstr(r"Local\cc_limit_single_instance");
+        let _instance = CreateMutexW(ptr::null_mut(), 0, mutex_name.as_ptr());
+        if _instance.is_null() {
+            return;
+        }
+        let err = GetLastError();
+        if err == ERROR_ALREADY_EXISTS || err == ERROR_ACCESS_DENIED {
+            return;
+        }
         let hinst = GetModuleHandleW(ptr::null());
         let mut icon = LoadIconW(hinst, MAKEINTRESOURCEW(1));
         if icon.is_null() {

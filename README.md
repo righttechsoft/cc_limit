@@ -7,6 +7,7 @@ A thin status bar that sits at the top of your screen and shows how much of your
 ## What it does
 
 - Shows your current 5-hour Claude session usage as a thin colored bar.
+- Shows your weekly usage as a thin strip along the top edge of the bar.
 - Tells you how long until your session resets.
 - Sits above all other windows (yes, even fullscreen apps).
 - Reserves its strip of screen so maximized windows stop neatly below it instead of being covered.
@@ -26,6 +27,7 @@ It will use whatever you're already logged into Claude Code with — no extra si
 | Orange fill | You're under 70% used. Plenty left. |
 | Blue fill | You're between 70% and 90% used. Worth pacing yourself. |
 | Red fill | You're over 90% used. Wrap up soon. |
+| Thin strip along the top edge | Your weekly usage, same colors as above. |
 | Text on the right | `42% used · resets in 3h 18m` |
 
 The bar refreshes every minute on its own. If something goes wrong it'll keep showing the last good value while it retries quietly in the background.
@@ -71,6 +73,9 @@ The app stores a tiny config file (which screen you picked) in your user folder,
 
 **The bar shows the same number for a long time.**
 It refreshes once a minute. If it really is stuck, right-click → Refresh now.
+
+**The bar shows an HTTP or rate-limit error.**
+It backs off on its own, waiting longer after each failure (up to 15 minutes between tries), and recovers by itself. Only one copy of the app can run at a time; a second launch exits quietly.
 
 **The bar isn't visible.**
 It might be on another monitor. Click the tray icon → Choose screen, and pick the one you're looking at.
